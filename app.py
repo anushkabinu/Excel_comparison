@@ -539,19 +539,15 @@ if client_upload and output_upload:
             def _render_dup_panel(col, label: str, dup: dict):
                 with col:
                     st.markdown(f"**{label}**")
-                    # Summary line
+
                     if dup["has_duplicates"]:
                         st.warning(
-                            f"⚠️ **{dup['duplicate_row_count']}** duplicate row(s) found  "
-                            f"({dup['duplicate_occurrence_count']} extra occurrence(s), "
+                            f"⚠️ **{dup['duplicate_row_count']}** "
+                            f"duplicate row(s) found "
+                            f"({dup['duplicate_occurrence_count']} "
+                            f"extra occurrence(s), "
                             f"{dup['unique_rows']} unique rows)"
-                        )
-                        _dup_df = pd.DataFrame(dup["duplicates"])
-                        # Move 'count' column to front for readability
-                        if "count" in _dup_df.columns:
-                            _cols_order = ["count"] + [c for c in _dup_df.columns if c != "count"]
-                            _dup_df = _dup_df[_cols_order]
-                        st.dataframe(_dup_df, use_container_width=True, hide_index=True)
+                            )
                     else:
                         st.success("✅ No duplicate rows found")
 
