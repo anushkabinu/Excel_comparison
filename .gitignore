@@ -1,0 +1,65 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+*.egg
+*.egg-info/
+dist/
+build/
+*.spec
+
+# Virtual Environment
+env/
+venv/
+.venv/
+ENV/
+
+# PyInstaller
+*.manifest
+*.exe
+
+# Icon files
+*.ico
+*.icns
+
+# Distribution / Packaging
+*.zip
+*.tar.gz
+*.whl
+
+# Generated output
+reconciler/output/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Streamlit
+.streamlit/
+
+# Logs
+*.log
+logs/
+
+# Temp / Cache
+*.tmp
+*.cache
+.cache/
+temp/
+
+# Jupyter Notebooks (if any)
+.ipynb_checkpoints/
+
+# Environment variables
+.env
+.env.*

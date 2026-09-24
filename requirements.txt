@@ -1,0 +1,7 @@
+streamlit>=1.35.0
+pandas>=2.0.0
+openpyxl>=3.1.0
+xlrd>=2.0.1
+pyxlsb>=1.0.10
+rapidfuzz>=3.6.0
+numpy>=1.26.0
