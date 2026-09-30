@@ -168,6 +168,10 @@ def _init_state():
         "comparison_mode": "advanced",  # 'advanced' or 'simple'
         "precheck_done": False,
         "precheck_time": None,
+        "client_sheet_names": None,     # list of sheet names from client file
+        "output_sheet_names": None,     # list of sheet names from output file
+        "client_chosen_sheet": None,    # user-selected sheet for client file
+        "output_chosen_sheet": None,    # user-selected sheet for output file
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -271,6 +275,11 @@ with st.container():
             st.session_state.output_file_name = output_upload.name
             st.session_state.precheck_done = False
             st.session_state.step = 1
+            # Reset sheet selection so selectors re-populate for the new files
+            st.session_state.client_sheet_names = None
+            st.session_state.output_sheet_names = None
+            st.session_state.client_chosen_sheet = None
+            st.session_state.output_chosen_sheet = None
 
         st.success(f"✅ **{client_upload.name}** and **{output_upload.name}** uploaded.")
 
@@ -280,115 +289,115 @@ with st.container():
         # every row as plain strings without promoting any row to a header.
         # client_result / output_result are NOT set here; they are populated
         # only when the user clicks "Analyse Files".
-        if not st.session_state.precheck_done:
-            with st.spinner("Running quick row pre-check…"):
-                try:
-                    # Start timer
-                    precheck_start = time.perf_counter()
-                    _cp_pc  = _save_uploaded(client_upload)
-                    _op_pc  = _save_uploaded(output_upload)
-                    _raw_c  = read_excel_raw(_cp_pc)
-                    _raw_o  = read_excel_raw(_op_pc)
-                    st.session_state.precheck_result = run_simple_row_match(
-                        _raw_c, _raw_o
-                    )
-                     # End timer
-                    precheck_end = time.perf_counter()
-                    
-                    # Store elapsed time
-                    st.session_state.precheck_time = precheck_end - precheck_start
-
-                    st.session_state.precheck_done = True
-                except Exception as _e:
-                    st.warning(f"⚠️ Pre-check skipped: {_e}")
+        # if not st.session_state.precheck_done:
+        #     with st.spinner("Running quick row pre-check…"):
+        #         try:
+        #             # Start timer
+        #             precheck_start = time.perf_counter()
+        #             _cp_pc  = _save_uploaded(client_upload)
+        #             _op_pc  = _save_uploaded(output_upload)
+        #             _raw_c  = read_excel_raw(_cp_pc)
+        #             _raw_o  = read_excel_raw(_op_pc)
+        #             st.session_state.precheck_result = run_simple_row_match(
+        #                 _raw_c, _raw_o
+        #             )
+        #             # End timer
+        #             precheck_end = time.perf_counter()
+        #
+        #             # Store elapsed time
+        #             st.session_state.precheck_time = precheck_end - precheck_start
+        #
+        #             st.session_state.precheck_done = True
+        #         except Exception as _e:
+        #             st.warning(f"⚠️ Pre-check skipped: {_e}")
 # ============================================================
 # PRE-CHECK RESULT — persistent across all steps
 # ============================================================
 
-if st.session_state.precheck_result is not None:
-    _pc       = st.session_state.precheck_result
-    _pc_pct   = _pc["match_pct"]
-    _pc_color = "green" if _pc_pct >= 95 else "yellow" if _pc_pct >= 80 else "red"
-
-    st.markdown('<hr class="section-divider">', unsafe_allow_html=True)
-    st.markdown("#### 🔍 Pre-Check: Exact Row Match")
-
-    # Show elapsed time (always, regardless of how long it took)
-    if st.session_state.precheck_time is not None:
-        elapsed = st.session_state.precheck_time
-        if elapsed < 60:
-            st.info(f"⏱️ Pre-check completed in {elapsed:.2f} seconds")
-        else:
-            minutes = int(elapsed // 60)
-            seconds = elapsed % 60
-            st.info(f"⏱️ Pre-check completed in {minutes} min {seconds:.2f} sec")
-
-    st.caption(
-        "Every client row is looked up verbatim in the output file using "
-        "**exact tuple matching** (whitespace-normalised). "
-        "Proceed to **Analyse Files** below for the full column-mapped comparison."
-    )
-
-    st.markdown(f"""
-    <div class="metric-row">
-      <div class="metric-card">
-        <div class="metric-value blue">{_pc['total_human']}</div>
-        <div class="metric-label">Client Rows</div>
-      </div>
-      <div class="metric-card">
-        <div class="metric-value blue">{_pc['total_output']}</div>
-        <div class="metric-label">Output Rows</div>
-      </div>
-      <div class="metric-card">
-        <div class="metric-value green">{_pc['matched_count']}</div>
-        <div class="metric-label">Exact Matches</div>
-      </div>
-      <div class="metric-card">
-        <div class="metric-value red">{_pc['unmatched_count']}</div>
-        <div class="metric-label">Unmatched<br><small>(client → not in output)</small></div>
-      </div>
-      <div class="metric-card">
-        <div class="metric-value purple">{_pc['extra_count']}</div>
-        <div class="metric-label">Extra<br><small>(output → not in client)</small></div>
-      </div>
-      <div class="metric-card">
-        <div class="metric-value {_pc_color}">{_pc_pct:.1f}%</div>
-        <div class="metric-label">Row Match Rate</div>
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    _pct1, _pct2, _pct3 = st.tabs([
-        f"✅ Matched ({_pc['matched_count']})",
-        f"❌ Unmatched — client NOT in output ({_pc['unmatched_count']})",
-        f"➕ Extra — output NOT in client ({_pc['extra_count']})",
-    ])
-    with _pct1:
-        _df_m = pd.DataFrame([
-            {"Client Row #": r["human_row"],
-             "Output Row #": r["system_rows"][0],
-             **{k: v for k, v in r["row_data"].items()}}
-            for r in _pc["matched_rows"]
-        ])
-        if not _df_m.empty:
-            st.dataframe(_df_m, use_container_width=True, hide_index=True)
-        else:
-            st.warning("⚠️ No rows matched exactly.")
-    with _pct2:
-        _df_u = pd.DataFrame([
-            {"Client Row #": r["human_row"],
-             **{k: v for k, v in r["row_data"].items()}}
-            for r in _pc["unmatched_rows"]
-        ])
-        if not _df_u.empty:
-            st.dataframe(_df_u, use_container_width=True, hide_index=True)
-        else:
-            st.success("✅ Every client row was found in the output file!")
-    with _pct3:
-        if not _pc["extra_rows_df"].empty:
-            st.dataframe(_pc["extra_rows_df"], use_container_width=True, hide_index=True)
-        else:
-            st.success("✅ No extra rows in the output file.")
+# if st.session_state.precheck_result is not None:
+#     _pc       = st.session_state.precheck_result
+#     _pc_pct   = _pc["match_pct"]
+#     _pc_color = "green" if _pc_pct >= 95 else "yellow" if _pc_pct >= 80 else "red"
+#
+#     st.markdown('<hr class="section-divider">', unsafe_allow_html=True)
+#     st.markdown("#### 🔍 Pre-Check: Exact Row Match")
+#
+#     # Show elapsed time (always, regardless of how long it took)
+#     if st.session_state.precheck_time is not None:
+#         elapsed = st.session_state.precheck_time
+#         if elapsed < 60:
+#             st.info(f"⏱️ Pre-check completed in {elapsed:.2f} seconds")
+#         else:
+#             minutes = int(elapsed // 60)
+#             seconds = elapsed % 60
+#             st.info(f"⏱️ Pre-check completed in {minutes} min {seconds:.2f} sec")
+#
+#     st.caption(
+#         "Every client row is looked up verbatim in the output file using "
+#         "**exact tuple matching** (whitespace-normalised). "
+#         "Proceed to **Analyse Files** below for the full column-mapped comparison."
+#     )
+#
+#     st.markdown(f"""
+#     <div class="metric-row">
+#       <div class="metric-card">
+#         <div class="metric-value blue">{_pc['total_human']}</div>
+#         <div class="metric-label">Client Rows</div>
+#       </div>
+#       <div class="metric-card">
+#         <div class="metric-value blue">{_pc['total_output']}</div>
+#         <div class="metric-label">Output Rows</div>
+#       </div>
+#       <div class="metric-card">
+#         <div class="metric-value green">{_pc['matched_count']}</div>
+#         <div class="metric-label">Exact Matches</div>
+#       </div>
+#       <div class="metric-card">
+#         <div class="metric-value red">{_pc['unmatched_count']}</div>
+#         <div class="metric-label">Unmatched<br><small>(client → not in output)</small></div>
+#       </div>
+#       <div class="metric-card">
+#         <div class="metric-value purple">{_pc['extra_count']}</div>
+#         <div class="metric-label">Extra<br><small>(output → not in client)</small></div>
+#       </div>
+#       <div class="metric-card">
+#         <div class="metric-value {_pc_color}">{_pc_pct:.1f}%</div>
+#         <div class="metric-label">Row Match Rate</div>
+#       </div>
+#     </div>
+#     """, unsafe_allow_html=True)
+#
+#     _pct1, _pct2, _pct3 = st.tabs([
+#         f"✅ Matched ({_pc['matched_count']})",
+#         f"❌ Unmatched — client NOT in output ({_pc['unmatched_count']})",
+#         f"➕ Extra — output NOT in client ({_pc['extra_count']})",
+#     ])
+#     with _pct1:
+#         _df_m = pd.DataFrame([
+#             {"Client Row #": r["human_row"],
+#              "Output Row #": r["system_rows"][0],
+#              **{k: v for k, v in r["row_data"].items()}}
+#             for r in _pc["matched_rows"]
+#         ])
+#         if not _df_m.empty:
+#             st.dataframe(_df_m, use_container_width=True, hide_index=True)
+#         else:
+#             st.warning("⚠️ No rows matched exactly.")
+#     with _pct2:
+#         _df_u = pd.DataFrame([
+#             {"Client Row #": r["human_row"],
+#              **{k: v for k, v in r["row_data"].items()}}
+#             for r in _pc["unmatched_rows"]
+#         ])
+#         if not _df_u.empty:
+#             st.dataframe(_df_u, use_container_width=True, hide_index=True)
+#         else:
+#             st.success("✅ Every client row was found in the output file!")
+#     with _pct3:
+#         if not _pc["extra_rows_df"].empty:
+#             st.dataframe(_pc["extra_rows_df"], use_container_width=True, hide_index=True)
+#         else:
+#             st.success("✅ No extra rows in the output file.")
 # ---------------------------------------------------------------------------
 # Step 2 — Analyse & Map Columns
 # ---------------------------------------------------------------------------
@@ -397,6 +406,97 @@ if client_upload and output_upload:
     st.markdown('<hr class="section-divider">', unsafe_allow_html=True)
     st.markdown("### 🔍 Step 2 — Analyse & Map Columns")
 
+    # ── Sheet selector: peek at workbook tabs without full parse ─────────────
+    # Only re-peek when files change (already reset by _reset_from above)
+    def _peek_sheet_names(uploaded_file) -> list[str]:
+        """Read sheet names only — very fast, no data parsing."""
+        import tempfile, os
+        suffix = os.path.splitext(uploaded_file.name)[-1]
+        uploaded_file.seek(0)
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+        tmp.write(uploaded_file.read())
+        tmp.flush(); tmp.close()
+        uploaded_file.seek(0)   # reset so _save_uploaded can re-read it
+        try:
+            xl = pd.ExcelFile(tmp.name)
+            return xl.sheet_names
+        except Exception:
+            return []
+
+    if st.session_state.client_sheet_names is None:
+        st.session_state.client_sheet_names = _peek_sheet_names(client_upload)
+    if st.session_state.output_sheet_names is None:
+        st.session_state.output_sheet_names = _peek_sheet_names(output_upload)
+
+    _c_sheets = st.session_state.client_sheet_names or []
+    _o_sheets = st.session_state.output_sheet_names or []
+
+    if len(_c_sheets) > 1 or len(_o_sheets) > 1:
+        st.markdown("#### 📑 Sheet Selection")
+        st.caption(
+            "Multiple sheets detected in one or both files. "
+            "Select the sheet to use for comparison — the tool auto-detected a best guess, "
+            "but you can override it here before clicking **Analyse Files**."
+        )
+        _sh_col1, _sh_col2 = st.columns(2)
+
+        with _sh_col1:
+            st.markdown("**Client File — Sheet**")
+            if _c_sheets:
+                # Auto-detect best sheet for default
+                if st.session_state.client_chosen_sheet not in _c_sheets:
+                    from reconciler.file_reader import _detect_best_sheet, _read_raw
+                    try:
+                        _tmp_c = _save_uploaded(client_upload)
+                        _raw_c_sheets = _read_raw(_tmp_c)
+                        _auto_c = _detect_best_sheet(_raw_c_sheets)
+                    except Exception:
+                        _auto_c = _c_sheets[0]
+                    st.session_state.client_chosen_sheet = _auto_c
+
+                _c_idx = _c_sheets.index(st.session_state.client_chosen_sheet) \
+                         if st.session_state.client_chosen_sheet in _c_sheets else 0
+                _chosen_c = st.selectbox(
+                    "Client sheet",
+                    options=_c_sheets,
+                    index=_c_idx,
+                    key="client_sheet_sel",
+                    label_visibility="collapsed",
+                )
+                st.session_state.client_chosen_sheet = _chosen_c
+                if len(_c_sheets) > 1:
+                    st.caption(f"📄 {len(_c_sheets)} sheets found: {', '.join(f'`{s}`' for s in _c_sheets)}")
+            else:
+                st.info("Only one sheet — no selection needed.")
+
+        with _sh_col2:
+            st.markdown("**Output File — Sheet**")
+            if _o_sheets:
+                if st.session_state.output_chosen_sheet not in _o_sheets:
+                    try:
+                        _tmp_o = _save_uploaded(output_upload)
+                        _raw_o_sheets = _read_raw(_tmp_o)
+                        _auto_o = _detect_best_sheet(_raw_o_sheets)
+                    except Exception:
+                        _auto_o = _o_sheets[0]
+                    st.session_state.output_chosen_sheet = _auto_o
+
+                _o_idx = _o_sheets.index(st.session_state.output_chosen_sheet) \
+                         if st.session_state.output_chosen_sheet in _o_sheets else 0
+                _chosen_o = st.selectbox(
+                    "Output sheet",
+                    options=_o_sheets,
+                    index=_o_idx,
+                    key="output_sheet_sel",
+                    label_visibility="collapsed",
+                )
+                st.session_state.output_chosen_sheet = _chosen_o
+                if len(_o_sheets) > 1:
+                    st.caption(f"📄 {len(_o_sheets)} sheets found: {', '.join(f'`{s}`' for s in _o_sheets)}")
+            else:
+                st.info("Only one sheet — no selection needed.")
+
+        st.markdown("")
 
     analyse_col, _ = st.columns([1, 3])
     with analyse_col:
@@ -410,8 +510,12 @@ if client_upload and output_upload:
                     client_path = _save_uploaded(client_upload)
                     output_path = _save_uploaded(output_upload)
 
-                    cr = read_excel_file(client_path)
-                    orr = read_excel_file(output_path)
+                    # Use user-chosen sheets (or None → auto-detect)
+                    _force_c = st.session_state.get("client_chosen_sheet") or None
+                    _force_o = st.session_state.get("output_chosen_sheet") or None
+
+                    cr = read_excel_file(client_path, force_sheet=_force_c)
+                    orr = read_excel_file(output_path, force_sheet=_force_o)
 
                     st.session_state.client_result = cr
                     st.session_state.output_result = orr
@@ -997,13 +1101,14 @@ if st.session_state.comparison_result is not None:
     _c_dup_count = len(_c_dups) if _c_dups is not None and not _c_dups.empty else 0
     _o_dup_count = len(_o_dups) if _o_dups is not None and not _o_dups.empty else 0
 
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
         f"📋 Row Results ({s.matched_rows + s.mismatched_rows})",
         f"🔬 Cell Differences ({s.mismatched_cells})",
         f"⚠️ Missing Rows ({s.missing_rows}) — in client, NOT in output",
         f"➕ Extra Rows ({s.extra_rows}) — in output, NOT in client",
         f"🔁 Duplicates — Client ({_c_dup_count})",
         f"🔁 Duplicates — Output ({_o_dup_count})",
+        "🔎 Single Field Comparison",
     ])
 
     with tab1:
@@ -1051,6 +1156,157 @@ if st.session_state.comparison_result is not None:
             st.dataframe(_o_dups, use_container_width=True, hide_index=True)
         else:
             st.success("✅ No duplicate rows found in the output file.")
+
+    with tab7:
+        st.caption(
+            "Select a single mapped column to inspect all differences in that field only. "
+            "Useful for drilling into one specific column without the noise of the full diff table."
+        )
+
+        # Build list of all compared columns from column_mappings
+        _all_compared_cols = sorted({
+            m.client_col
+            for m in result.column_mappings
+            if m.output_col
+        })
+
+        if not _all_compared_cols:
+            st.warning("⚠️ No mapped columns found in the comparison result.")
+        else:
+            _sf_col = st.selectbox(
+                "Select column to compare",
+                options=_all_compared_cols,
+                key="single_field_select",
+                help="Only differences for this column will be shown below.",
+            )
+
+            # Find the mapped output column name for display
+            _sf_output_col = next(
+                (m.output_col for m in result.column_mappings if m.client_col == _sf_col),
+                _sf_col,
+            )
+
+            # Column label
+            _label_suffix = (
+                f" → `{_sf_output_col}`"
+                if _sf_output_col and _sf_output_col != _sf_col
+                else ""
+            )
+            st.markdown(
+                f"**Column:** `{_sf_col}`{_label_suffix}",
+                unsafe_allow_html=True,
+            )
+
+            # ── Value Distribution ─────────────────────────────────────────
+            st.markdown("---")
+            with st.expander("📊 Value Distribution — Unique Value Counts per File", expanded=True):
+                st.caption(
+                    "How many times each unique value appears in this column across both files. "
+                    "Use this to spot count mismatches (e.g. 100 × '27' in client vs 95 × '27' in output)."
+                )
+
+                _cr_df  = st.session_state.client_result.df
+                _orr_df = st.session_state.output_result.df
+
+                # Value counts from each file (use the correct column name per file)
+                if _sf_col in _cr_df.columns:
+                    _vc_client = (
+                        _cr_df[_sf_col]
+                        .dropna()
+                        .astype(str)
+                        .value_counts()
+                        .rename("Client Count")
+                        .rename_axis("Value")
+                        .reset_index()
+                    )
+                else:
+                    _vc_client = pd.DataFrame(columns=["Value", "Client Count"])
+
+                if _sf_output_col and _sf_output_col in _orr_df.columns:
+                    _vc_output = (
+                        _orr_df[_sf_output_col]
+                        .dropna()
+                        .astype(str)
+                        .value_counts()
+                        .rename("Output Count")
+                        .rename_axis("Value")
+                        .reset_index()
+                    )
+                else:
+                    _vc_output = pd.DataFrame(columns=["Value", "Output Count"])
+
+                # Merge on Value (outer join to catch values only in one file)
+                _vc_merged = (
+                    _vc_client
+                    .merge(_vc_output, on="Value", how="outer")
+                    .fillna(0)
+                    .astype({"Client Count": int, "Output Count": int})
+                )
+                _vc_merged["Difference"] = _vc_merged["Client Count"] - _vc_merged["Output Count"]
+
+                # Client/Output % share
+                _c_total_rows = _vc_merged["Client Count"].sum()
+                _o_total_rows = _vc_merged["Output Count"].sum()
+                _vc_merged["Client %"] = (
+                    (_vc_merged["Client Count"] / _c_total_rows * 100).round(2)
+                    if _c_total_rows > 0 else 0.0
+                )
+                _vc_merged["Output %"] = (
+                    (_vc_merged["Output Count"] / _o_total_rows * 100).round(2)
+                    if _o_total_rows > 0 else 0.0
+                )
+
+                # Sort by Client Count descending
+                _vc_merged = _vc_merged.sort_values("Client Count", ascending=False).reset_index(drop=True)
+
+                # Reorder columns nicely
+                _vc_display = _vc_merged[["Value", "Client Count", "Client %", "Output Count", "Output %", "Difference"]]
+
+                # Show summary line
+                _n_unique_vals = len(_vc_merged)
+                _n_diff_vals   = (_vc_merged["Difference"] != 0).sum()
+                if _n_diff_vals == 0:
+                    st.success(f"✅ All {_n_unique_vals} unique value(s) have the same count in both files.")
+                else:
+                    st.warning(
+                        f"⚠️ **{_n_diff_vals}** of **{_n_unique_vals}** unique value(s) have a "
+                        f"count mismatch between the two files."
+                    )
+
+                # Side-by-side tables
+                _vd_col1, _vd_col2 = st.columns(2)
+
+                with _vd_col1:
+                    st.markdown(f"**📄 Client — `{_sf_col}`**")
+                    _vc_client_display = (
+                        _vc_merged[["Value", "Client Count", "Client %"]]
+                        .rename(columns={"Client Count": "Count", "Client %": "% of Rows"})
+                        .sort_values("Count", ascending=False)
+                        .reset_index(drop=True)
+                    )
+                    st.dataframe(_vc_client_display, use_container_width=True, hide_index=True)
+
+                with _vd_col2:
+                    st.markdown(f"**📄 Output — `{_sf_output_col}`**")
+                    _vc_output_display = (
+                        _vc_merged[["Value", "Output Count", "Output %"]]
+                        .rename(columns={"Output Count": "Count", "Output %": "% of Rows"})
+                        .sort_values("Count", ascending=False)
+                        .reset_index(drop=True)
+                    )
+                    st.dataframe(_vc_output_display, use_container_width=True, hide_index=True)
+
+                # CSV download for distribution
+                _vc_csv = _vc_display.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    label=f"⬇️ Download `{_sf_col}` value distribution as CSV",
+                    data=_vc_csv,
+                    file_name=f"distribution_{_sf_col.replace(' ', '_')}.csv",
+                    mime="text/csv",
+                    key="sf_dist_csv_download",
+                )
+
+
 
     # Re-run button
     st.markdown('<hr class="section-divider">', unsafe_allow_html=True)
