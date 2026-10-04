@@ -332,3 +332,307 @@ def generate_report(
 
     wb.save(filepath)
     return os.path.abspath(filepath)
+
+
+# ---------------------------------------------------------------------------
+# Wide-format report  (ACTUAL | EXPECTED | RESULT per column)
+# ---------------------------------------------------------------------------
+
+def _safe_cell_value(idx_df: pd.DataFrame, excel_row, col_name: str):
+    """Look up a single cell by excel row number; return '' on any miss."""
+    if excel_row is None or col_name not in idx_df.columns:
+        return ""
+    try:
+        val = idx_df.at[excel_row, col_name]
+    except Exception:
+        return ""
+    # .at can return a Series if the index has duplicates — take first
+    if isinstance(val, pd.Series):
+        val = val.iloc[0] if len(val) else ""
+    if pd.isna(val):
+        return ""
+    return val
+
+
+def generate_wide_report(
+    result: ComparisonResult,
+    df_client: pd.DataFrame,
+    df_output: pd.DataFrame,
+    output_dir: str = ".",
+    base_name: str = "wide_comparison_report",
+) -> str:
+    """
+    Generate a wide-format Excel report where every compared column appears
+    as three sub-columns: ACTUAL (client), EXPECTED (output), RESULT (PASS/FAIL).
+
+    Each data row is a **key-matched pair** from ComparisonResult (not positional).
+    ACTUAL is always taken from the client excel row; EXPECTED from the paired
+    output excel row. PASS/FAIL comes from the comparator (incl. numeric tolerance).
+
+    Layout
+    ------
+    Row 1 : ROW #  |  OUT ROW #  |  <FIELD_NAME>  (merged 3 cols)  |  ...
+    Row 2 :        |             |  ACTUAL  |  EXPECTED  |  RESULT  |  ...
+    Row 3+: data
+    Footer: per-field match rates + average match rate
+
+    Sheet 2 — Field Match Summary: total / matched / not matched / match rate per field.
+
+    Returns the absolute path to the written .xlsx file.
+    """
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename  = f"{base_name}_{timestamp}.xlsx"
+    filepath  = os.path.join(output_dir, filename)
+
+    # ── 1. Pre-build lookup structures ─────────────────────────────────────
+
+    # Index original DataFrames by _excel_row_ for fast value lookup
+    _ERR = "_excel_row_"
+    if _ERR in df_client.columns:
+        client_idx = df_client.set_index(_ERR)
+    else:
+        client_idx = df_client.copy()
+        client_idx.index = range(len(client_idx))
+
+    if _ERR in df_output.columns:
+        output_idx = df_output.set_index(_ERR)
+    else:
+        output_idx = df_output.copy()
+        output_idx.index = range(len(output_idx))
+
+    # Cells the comparator flagged as different (already applied numeric tolerance)
+    diff_set: set = {(cd.row_key, cd.column_name) for cd in result.cell_diffs}
+
+    # Only columns that have an output mapping (excluded cols are already filtered out)
+    col_pairs = [
+        (m.client_col, m.output_col)
+        for m in result.column_mappings
+        if m.output_col
+    ]
+
+    # ── 2. Build data rows from key-matched pairs only ─────────────────────
+
+    data_rows = []
+    field_pass_counts = [0] * len(col_pairs)
+
+    for rr in result.row_results:
+        if rr.status in ("MISSING", "EXTRA"):
+            continue
+
+        # Always pull ACTUAL/EXPECTED from the exact key-paired excel rows
+        row = [rr.client_excel_row, rr.output_excel_row]
+
+        for field_idx, (client_col, output_col) in enumerate(col_pairs):
+            c_val = _safe_cell_value(client_idx, rr.client_excel_row, client_col)
+            o_val = _safe_cell_value(output_idx, rr.output_excel_row, output_col)
+
+            # RESULT follows comparator decision (tolerance already applied)
+            if (rr.row_key, client_col) in diff_set:
+                res = "FAIL"
+            else:
+                res = "PASS"
+                field_pass_counts[field_idx] += 1
+
+            row.extend([c_val, o_val, res])
+
+        data_rows.append(row)
+
+    n_compared = len(data_rows)
+    field_match_rates = [
+        (field_pass_counts[i] / n_compared * 100.0) if n_compared > 0 else 0.0
+        for i in range(len(col_pairs))
+    ]
+    avg_match_rate = (
+        sum(field_match_rates) / len(field_match_rates)
+        if field_match_rates else 0.0
+    )
+
+    # ── 3. Write workbook ──────────────────────────────────────────────────
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Side-by-Side"
+
+    # Colour fills
+    _PASS_FILL   = PatternFill("solid", fgColor="C6EFCE")   # green
+    _FAIL_FILL   = PatternFill("solid", fgColor="FFC7CE")   # red
+    _FIELD_FILL  = PatternFill("solid", fgColor="BDD7EE")   # blue — field name header
+    _SUB_FILL    = PatternFill("solid", fgColor="D9D9D9")   # grey — ACTUAL/EXPECTED/RESULT
+    _FOOTER_FILL = PatternFill("solid", fgColor="FFF2CC")   # light yellow — match rates
+
+    bold_blue = Font(bold=True, color="1F3864")
+    bold_dark = Font(bold=True, color="1F3864")
+    center    = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    # Column layout: A = Client ROW #, B = Output ROW #, then field triples from col 3
+    _DATA_COL0 = 3   # first ACTUAL column
+
+    # ── Row 1: field name headers (merged across 3 columns each) ───────────
+    ws.merge_cells(start_row=1, start_column=1, end_row=2, end_column=1)
+    c = ws.cell(row=1, column=1, value="ROW #")
+    c.font = bold_blue
+    c.fill = _FIELD_FILL
+    c.alignment = center
+    c.border = _THIN_BORDER
+
+    ws.merge_cells(start_row=1, start_column=2, end_row=2, end_column=2)
+    c = ws.cell(row=1, column=2, value="OUT ROW #")
+    c.font = bold_blue
+    c.fill = _FIELD_FILL
+    c.alignment = center
+    c.border = _THIN_BORDER
+
+    for field_idx, (client_col, _output_col) in enumerate(col_pairs):
+        col_start = _DATA_COL0 + field_idx * 3
+        col_end   = col_start + 2
+
+        ws.merge_cells(start_row=1, start_column=col_start, end_row=1, end_column=col_end)
+        c = ws.cell(row=1, column=col_start, value=client_col)
+        c.font = bold_blue
+        c.fill = _FIELD_FILL
+        c.alignment = center
+        c.border = _THIN_BORDER
+
+    # ── Row 2: ACTUAL / EXPECTED / RESULT sub-headers ─────────────────────
+    for field_idx in range(len(col_pairs)):
+        col_start = _DATA_COL0 + field_idx * 3
+        for sub_idx, label in enumerate(["ACTUAL", "EXPECTED", "RESULT"]):
+            c = ws.cell(row=2, column=col_start + sub_idx, value=label)
+            c.font = bold_dark
+            c.fill = _SUB_FILL
+            c.alignment = center
+            c.border = _THIN_BORDER
+
+    # ── Rows 3+: data ─────────────────────────────────────────────────────
+    for row_offset, row_vals in enumerate(data_rows, start=3):
+        for col_offset, val in enumerate(row_vals, start=1):
+            c = ws.cell(row=row_offset, column=col_offset, value=val)
+            c.border = _THIN_BORDER
+            if col_offset <= 2:
+                c.alignment = center
+                continue
+            # Colour the RESULT column (third of each triple)
+            sub_pos = (col_offset - _DATA_COL0) % 3
+            if sub_pos == 2:
+                c.fill = _PASS_FILL if val == "PASS" else _FAIL_FILL
+                c.font = Font(bold=True)
+                c.alignment = center
+
+    last_data_row = 2 + n_compared   # header rows 1-2, data starts at 3
+
+    # ── Footer: per-field match rate + average ─────────────────────────────
+    footer_row = last_data_row + 2
+    c = ws.cell(row=footer_row, column=1, value="MATCH RATE")
+    c.font = Font(bold=True, size=11, color="1F3864")
+    c.fill = _FOOTER_FILL
+    c.alignment = center
+    c.border = _THIN_BORDER
+    ws.merge_cells(
+        start_row=footer_row, start_column=1,
+        end_row=footer_row, end_column=2,
+    )
+
+    for field_idx, rate in enumerate(field_match_rates):
+        col_start = _DATA_COL0 + field_idx * 3
+        col_end   = col_start + 2
+        ws.merge_cells(
+            start_row=footer_row, start_column=col_start,
+            end_row=footer_row, end_column=col_end,
+        )
+        rate_fill = (
+            _PASS_FILL if rate >= 95 else
+            _FOOTER_FILL if rate >= 80 else
+            _FAIL_FILL
+        )
+        c = ws.cell(row=footer_row, column=col_start, value=f"{rate:.1f}%")
+        c.font = Font(bold=True)
+        c.fill = rate_fill
+        c.alignment = center
+        c.border = _THIN_BORDER
+
+    avg_row = footer_row + 1
+    c = ws.cell(
+        row=avg_row, column=1,
+        value=(
+            f"Average Match Rate: {avg_match_rate:.1f}%   "
+            f"({n_compared} paired rows x {len(col_pairs)} fields)   "
+            f"| abs_tol={result.summary.abs_tolerance}  "
+            f"rel_tol={result.summary.rel_tolerance}"
+        ),
+    )
+    c.font = Font(bold=True, size=12, color="1F3864")
+    c.fill = _FOOTER_FILL
+    end_col = max(2, _DATA_COL0 + len(col_pairs) * 3 - 1)
+    ws.merge_cells(
+        start_row=avg_row, start_column=1,
+        end_row=avg_row, end_column=end_col,
+    )
+
+    # ── Sheet 2: field match summary ───────────────────────────────────────
+    ws_sum = wb.create_sheet("Field Match Summary")
+    sum_headers = [
+        "Field Name",
+        "Total Fields",
+        "PASS",
+        "FAIL",
+        "ACCURACY",
+        "AVERAGE ACCURACY"
+    ]
+    _write_header_row(ws_sum, 1, sum_headers)
+    _freeze_top_row(ws_sum)
+
+    n_fields = len(col_pairs)
+    data_start = 2                     # first data row (row 2)
+    data_end   = data_start + n_fields - 1  # last data row
+
+    for field_idx, (client_col, _) in enumerate(col_pairs):
+        matched     = field_pass_counts[field_idx]
+        not_matched = n_compared - matched
+        rate        = field_match_rates[field_idx]
+        _write_data_row(ws_sum, data_start + field_idx, [
+            client_col,
+            n_compared,
+            matched,
+            not_matched,
+            f"{rate:.2f}%",
+            "",   # column F left blank — filled by merged cell below
+        ])
+
+    # ── Single merged AVERAGE ACCURACY cell spanning all data rows ──────────
+    if n_fields > 0:
+        _AVG_FILL  = PatternFill("solid", fgColor="FFF2CC")   # light yellow
+        _avg_color = "375623" if avg_match_rate >= 95 else "9C5700" if avg_match_rate >= 80 else "9C0006"
+
+        if data_end > data_start:
+            ws_sum.merge_cells(
+                start_row=data_start, start_column=6,
+                end_row=data_end,     end_column=6,
+            )
+        c = ws_sum.cell(row=data_start, column=6,
+                        value=f"{avg_match_rate:.2f}%")
+        c.font      = Font(bold=True, size=14, color=_avg_color)
+        c.fill      = _AVG_FILL
+        c.alignment = Alignment(horizontal="center", vertical="center")
+        c.border    = _THIN_BORDER
+
+    _autofit_columns(ws_sum)
+    ws_sum.column_dimensions["F"].width = 20
+
+
+
+
+    # ── Column widths ──────────────────────────────────────────────────────
+    ws.column_dimensions["A"].width = 10   # Client ROW #
+    ws.column_dimensions["B"].width = 12   # Output ROW #
+    for field_idx in range(len(col_pairs)):
+        col_start = _DATA_COL0 + field_idx * 3
+        for sub in range(3):
+            letter = get_column_letter(col_start + sub)
+            ws.column_dimensions[letter].width = 30 if sub < 2 else 10
+
+    # Freeze first two header rows + row-number columns
+    ws.freeze_panes = ws.cell(row=3, column=_DATA_COL0)
+
+    wb.save(filepath)
+    return os.path.abspath(filepath)
+

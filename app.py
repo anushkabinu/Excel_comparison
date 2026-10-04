@@ -36,7 +36,7 @@ from reconciler.header_mapper import (
 )
 from reconciler.row_matcher import detect_key_fields, align_rows, KeyFieldResult
 from reconciler.comparator import compare_dataframes, ComparisonResult
-from reconciler.report_generator import generate_report
+from reconciler.report_generator import generate_report, generate_wide_report
 from reconciler.row_comparison import run_simple_row_match, check_duplicate_rows
 
 # ---------------------------------------------------------------------------
@@ -156,8 +156,12 @@ def _init_state():
         "key_result": None,
         "output_key_result": None,
         "comparison_result": None,
+        "inferred_identity_cols": None,
+        "ambiguous_rows": 0,
         "report_bytes": None,
         "report_filename": None,
+        "wide_report_bytes": None,
+        "wide_report_filename": None,
         "client_file_name": None,
         "output_file_name": None,
         "client_duplicates": None,
@@ -213,6 +217,7 @@ def _reset_from(step: int):
         st.session_state.output_key_result = None
     if step <= 4:
         st.session_state.comparison_result = None
+        st.session_state.inferred_identity_cols = None
         st.session_state.report_bytes = None
         st.session_state.report_filename = None
         st.session_state.client_duplicates = None
@@ -519,6 +524,14 @@ if client_upload and output_upload:
 
                     st.session_state.client_result = cr
                     st.session_state.output_result = orr
+
+                    # Show which sheets were actually loaded
+                    st.info(
+                        f"📄 **Client:** reading sheet `{cr.sheet_name}` "
+                        f"({len(cr.df)} rows)  |  "
+                        f"**Output:** reading sheet `{orr.sheet_name}` "
+                        f"({len(orr.df)} rows)"
+                    )
 
                     mr = map_columns(cr.df, orr.df)
                     st.session_state.mapping_result = mr
@@ -868,9 +881,10 @@ if st.session_state.mapping_result is not None:
 
     st.info(
         "💡 **How this works:** Rows are matched using **Field 1 + Field 2 + Field 3** as a "
-        "composite key. If only Field 1 is set, rows within the same group are matched "
-        "by alphabetical order (occurrence #1, #2, #3…). "
-        "Add Field 2 or Field 3 to make matching exact."
+        "composite key. If only Field 1 is set, each client row is searched within its "
+        "primary group by checking other mapped fields one by one until exactly one output "
+        "row remains — file row order is not used. Fields expected to differ "
+        "(price, text, timestamps…) are ignored for matching and compared afterwards."
     )
 
     # Warn if no unique identifier is set — occurrence-based matching can hide deletions
@@ -879,11 +893,10 @@ if st.session_state.mapping_result is not None:
     _key3_set = sel_id_c  != none_opt
     if _key1_set and not _key2_set and not _key3_set:
         st.warning(
-            "⚠️ **Only Field 1 is set.** Rows within the same group are matched purely by "
-            "sorted occurrence order. If a row is deleted from the **middle** of a group, "
-            "the rows below it will shift up — the deleted row may appear as a cell difference "
-            "rather than a missing row. For accurate deletion detection, set **Field 2** or "
-            "**Field 3** to a column that uniquely identifies each row (e.g. product code, date)."
+            "ℹ️ **Only Field 1 is set.** Rows are matched inside each group using mapped "
+            "columns whose values are mostly unique and also present in both files. "
+            "Keep your ID columns mapped and not excluded. For full control, set "
+            "**Field 2** or **Field 3** to the column that identifies each row."
         )
 
     # Build key-col lists
@@ -981,7 +994,14 @@ if st.session_state.mapping_result is not None:
                     df_c_use, df_o_use,
                     client_key_cols=client_key_cols,
                     output_key_cols=output_key_cols,
+                    mapped_column_pairs=[
+                        (m.client_col, m.output_col)
+                        for m in confirmed
+                        if m.output_col
+                    ],
                 )
+                st.session_state.inferred_identity_cols = aligned.inferred_identity_cols
+                st.session_state.ambiguous_rows = aligned.ambiguous_rows
                 result = compare_dataframes(
                     aligned=aligned,
                     column_mappings=confirmed,
@@ -1033,6 +1053,23 @@ if st.session_state.comparison_result is not None:
     st.markdown('<hr class="section-divider">', unsafe_allow_html=True)
     st.markdown("### 📊 Step 6 — Results")
 
+    _inferred = st.session_state.get("inferred_identity_cols") or []
+    if _inferred:
+        st.info(
+            "🔑 **Single key field:** within each primary group, output rows were found by "
+            "checking these columns in order: "
+            + ", ".join(f"`{c}`" for c in _inferred)
+            + " (not file row order)."
+        )
+        _amb = st.session_state.get("ambiguous_rows") or 0
+        if _amb:
+            st.warning(
+                f"⚠️ **{_amb} client row(s)** share identical identity values with other rows "
+                "(duplicates). They were paired to the output row where the most other "
+                "mapped fields agree. Set **Field 2/3** to a distinguishing column for "
+                "a guaranteed match on those rows."
+            )
+
     # ── Summary metric cards ───────────────────────────────────────────────
     _cell_match_color = 'green' if s.match_pct >= 95 else 'yellow' if s.match_pct >= 80 else 'red'
     _blank_diffs = s.missing_cell_values if hasattr(s, 'missing_cell_values') else 0
@@ -1076,10 +1113,10 @@ if st.session_state.comparison_result is not None:
     </div>
     """, unsafe_allow_html=True)
 
-    # ── Download button ────────────────────────────────────────────────────
+    # ── Download buttons ────────────────────────────────────────────────────
     if st.session_state.report_bytes:
         st.markdown('<hr class="section-divider">', unsafe_allow_html=True)
-        dl_col, _ = st.columns([1, 3])
+        dl_col, wide_col, _ = st.columns([1, 1, 2])
         with dl_col:
             st.download_button(
                 label="⬇️ Download Excel Report",
@@ -1089,10 +1126,38 @@ if st.session_state.comparison_result is not None:
                 type="primary",
                 use_container_width=True,
             )
+        with wide_col:
+            if st.button("📊 Generate Wide Format Report", use_container_width=True):
+                with st.spinner("Building ACTUAL | EXPECTED | RESULT report…"):
+                    try:
+                        _cr_df  = st.session_state.client_result.df
+                        _orr_df = st.session_state.output_result.df
+                        _wide_path = generate_wide_report(
+                            result=result,
+                            df_client=_cr_df,
+                            df_output=_orr_df,
+                            output_dir=tempfile.gettempdir(),
+                        )
+                        with open(_wide_path, "rb") as _wf:
+                            st.session_state.wide_report_bytes = _wf.read()
+                        st.session_state.wide_report_filename = os.path.basename(_wide_path)
+                    except Exception as _we:
+                        st.error(f"❌ Wide report error: {_we}")
+
+        if st.session_state.get("wide_report_bytes"):
+            st.download_button(
+                label="⬇️ Download Wide Format Report (ACTUAL | EXPECTED | RESULT)",
+                data=st.session_state.wide_report_bytes,
+                file_name=st.session_state.wide_report_filename,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=False,
+                key="wide_dl_btn",
+            )
         st.caption(
             f"📄 Report: `{st.session_state.report_filename}` — "
             "contains **Summary**, **Column Mapping**, **Row Comparison**, "
-            "**Cell Differences**, **Missing & Extra Rows** sheets."
+            "**Cell Differences**, **Missing & Extra Rows** sheets. "
+            "Use **Wide Format Report** for ACTUAL | EXPECTED | RESULT per field."
         )
 
     # ── Tabs ───────────────────────────────────────────────────────────────
@@ -1101,9 +1166,18 @@ if st.session_state.comparison_result is not None:
     _c_dup_count = len(_c_dups) if _c_dups is not None and not _c_dups.empty else 0
     _o_dup_count = len(_o_dups) if _o_dups is not None and not _o_dups.empty else 0
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-        f"📋 Row Results ({s.matched_rows + s.mismatched_rows})",
-        f"🔬 Cell Differences ({s.mismatched_cells})",
+    # Row Results + Cell Differences tabs removed from UI — same logic is in the
+    # Wide Format Report (ACTUAL | EXPECTED | RESULT). Keep Missing / Extra tabs.
+    # tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    #     f"📋 Row Results ({s.matched_rows + s.mismatched_rows})",
+    #     f"🔬 Cell Differences ({s.mismatched_cells})",
+    #     f"⚠️ Missing Rows ({s.missing_rows}) — in client, NOT in output",
+    #     f"➕ Extra Rows ({s.extra_rows}) — in output, NOT in client",
+    #     f"🔁 Duplicates — Client ({_c_dup_count})",
+    #     f"🔁 Duplicates — Output ({_o_dup_count})",
+    #     "🔎 Single Field Comparison",
+    # ])
+    tab3, tab4, tab5, tab6, tab7 = st.tabs([
         f"⚠️ Missing Rows ({s.missing_rows}) — in client, NOT in output",
         f"➕ Extra Rows ({s.extra_rows}) — in output, NOT in client",
         f"🔁 Duplicates — Client ({_c_dup_count})",
@@ -1111,21 +1185,21 @@ if st.session_state.comparison_result is not None:
         "🔎 Single Field Comparison",
     ])
 
-    with tab1:
-        st.caption("All matched and mismatched rows (rows that exist in both files). Green = match, red = differences found.")
-        row_df = pd.DataFrame([vars(rr) for rr in result.row_results]) if result.row_results else pd.DataFrame()
-        if not row_df.empty:
-            st.dataframe(row_df, use_container_width=True, hide_index=True)
-        else:
-            st.warning("⚠️ No row results to display.")
+    # with tab1:
+    #     st.caption("All matched and mismatched rows (rows that exist in both files). Green = match, red = differences found.")
+    #     row_df = pd.DataFrame([vars(rr) for rr in result.row_results]) if result.row_results else pd.DataFrame()
+    #     if not row_df.empty:
+    #         st.dataframe(row_df, use_container_width=True, hide_index=True)
+    #     else:
+    #         st.warning("⚠️ No row results to display.")
 
-    with tab2:
-        st.caption("Every cell that differed between the two files, showing client value vs output value.")
-        cell_df = pd.DataFrame([vars(cd) for cd in result.cell_diffs]) if result.cell_diffs else pd.DataFrame()
-        if not cell_df.empty:
-            st.dataframe(cell_df, use_container_width=True, hide_index=True)
-        else:
-            st.success("✅ No cell differences — all compared cells match!")
+    # with tab2:
+    #     st.caption("Every cell that differed between the two files, showing client value vs output value.")
+    #     cell_df = pd.DataFrame([vars(cd) for cd in result.cell_diffs]) if result.cell_diffs else pd.DataFrame()
+    #     if not cell_df.empty:
+    #         st.dataframe(cell_df, use_container_width=True, hide_index=True)
+    #     else:
+    #         st.success("✅ No cell differences — all compared cells match!")
 
     with tab3:
         st.caption("Rows present in the **client file** but not found in the output file.")
@@ -1186,7 +1260,22 @@ if st.session_state.comparison_result is not None:
                 _sf_col,
             )
 
-            # Column label
+            # Filter cell diffs to selected column
+            _sf_diffs = [cd for cd in result.cell_diffs if cd.column_name == _sf_col]
+            _sf_diff_count = len(_sf_diffs)
+
+            # Count rows where this column matched (present in row_results but NOT in cell_diffs for this col)
+            _sf_mismatch_keys = {cd.row_key for cd in _sf_diffs}
+            _sf_all_row_keys = {
+                rr.row_key for rr in result.row_results
+                if rr.status in ("MATCH", "MISMATCH")
+            }
+            _sf_matched_count = len(_sf_all_row_keys - _sf_mismatch_keys)
+            _sf_total = len(_sf_all_row_keys)
+            _sf_match_pct = (_sf_matched_count / _sf_total * 100) if _sf_total > 0 else 0.0
+            _sf_color = "green" if _sf_match_pct >= 95 else "yellow" if _sf_match_pct >= 80 else "red"
+
+            # Metric strip
             _label_suffix = (
                 f" → `{_sf_output_col}`"
                 if _sf_output_col and _sf_output_col != _sf_col
@@ -1196,6 +1285,26 @@ if st.session_state.comparison_result is not None:
                 f"**Column:** `{_sf_col}`{_label_suffix}",
                 unsafe_allow_html=True,
             )
+            st.markdown(f"""
+            <div class="metric-row">
+              <div class="metric-card">
+                <div class="metric-value blue">{_sf_total}</div>
+                <div class="metric-label">Rows Compared</div>
+              </div>
+              <div class="metric-card">
+                <div class="metric-value green">{_sf_matched_count}</div>
+                <div class="metric-label">Matched</div>
+              </div>
+              <div class="metric-card">
+                <div class="metric-value red">{_sf_diff_count}</div>
+                <div class="metric-label">Differences</div>
+              </div>
+              <div class="metric-card">
+                <div class="metric-value {_sf_color}">{_sf_match_pct:.1f}%</div>
+                <div class="metric-label">Match Rate</div>
+              </div>
+            </div>
+            """, unsafe_allow_html=True)
 
             # ── Value Distribution ─────────────────────────────────────────
             st.markdown("---")

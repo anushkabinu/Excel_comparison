@@ -39,6 +39,8 @@ class AlignedDataFrames:
     merged: pd.DataFrame          # outer merged rows where both files matched
     client_only: pd.DataFrame     # rows in client not matched in output
     output_only: pd.DataFrame     # rows in output not matched in client
+    inferred_identity_cols: list[str] = field(default_factory=list)
+    ambiguous_rows: int = 0       # client rows whose identity values repeat
 
 
 # ---------------------------------------------------------------------------
@@ -234,6 +236,278 @@ def _normalize_key_val(v) -> str:
     return s
 
 
+_NULL = "__NULL__"
+
+
+def _values_agree(a, b) -> bool:
+    """True if two cells hold the same value (numbers within a small tolerance)."""
+    x, y = _normalize_key_val(a), _normalize_key_val(b)
+    if x == y:
+        return x != _NULL
+    try:
+        fx, fy = float(x), float(y)
+    except ValueError:
+        return False
+    return abs(fx - fy) <= max(1e-6, 1e-4 * max(abs(fx), abs(fy)))
+
+def _is_numeric_comparison_col(series: pd.Series) -> bool:
+    """
+    Returns True if this column looks like a comparison/value field
+    (price, amount, quantity) rather than an identity field.
+    Heuristic: mostly numeric AND has significant fractional values.
+    """
+    sample = series.dropna().head(300)
+    if sample.empty:
+        return False
+    num = pd.to_numeric(sample, errors="coerce")
+    if num.notna().mean() < 0.7:
+        return False           # not mostly numeric — could be a string ID
+    has_fraction = (num.dropna() % 1 != 0).mean()
+    return bool(has_fraction > 0.1)   # >10% fractional values → comparison field
+
+def _pick_identity_columns(
+    df_client: pd.DataFrame,
+    df_output: pd.DataFrame,
+    primary_client: str,
+    primary_output: str,
+    mapped_pairs: list[tuple[str, Optional[str]]],
+    min_unique: float = 0.2,
+    min_overlap: float = 0.5,
+    max_cols: int = 5,
+) -> list[tuple[str, list[str], list[str]]]:
+    """
+    Choose mapped columns that can identify a row, best first.
+
+    A column qualifies as an identity column when:
+      1. It has enough distinct values in BOTH files (min_unique), AND
+      2. It is NOT a numeric comparison field (price, amount, qty), AND
+      3. EITHER:
+         a. HIGH cardinality (>=40% unique in both files) -> trusted
+            unconditionally regardless of cross-file overlap.  Low overlap
+            here simply means many rows are MISSING — not that the column
+            is expected to differ.  This fixes the case where client has
+            23 000 rows and output has 2 000: the unique ID column shows
+            ~9% cross-file overlap yet is the best possible identity key.
+         b. MEDIUM cardinality (20-40%) -> requires >=50% cross-file overlap
+            to guard against accidentally using a field that genuinely
+            differs between the two files.
+
+    Returns [(client_col, normalized_client_values, normalized_output_values), ...]
+    ordered best identity column first.
+    """
+    HIGH_CARDINALITY = 0.40   # >=40% unique in both files -> unconditionally trusted
+    scored = []
+
+    for client_col, output_col in mapped_pairs:
+        if not output_col or client_col == primary_client or output_col == primary_output:
+            continue
+        if client_col not in df_client.columns or output_col not in df_output.columns:
+            continue
+
+        unique_c = _cardinality_ratio(df_client[client_col])
+        unique_o = _cardinality_ratio(df_output[output_col])
+        unique = min(unique_c, unique_o)
+
+        if unique < min_unique:
+            continue    # too few distinct values to identify rows
+
+        # Exclude numeric columns with fractional values (prices / amounts)
+        if _is_numeric_comparison_col(df_client[client_col]):
+            continue
+
+        norm_c = df_client[client_col].map(_normalize_key_val)
+        norm_o = df_output[output_col].map(_normalize_key_val)
+        present = norm_c[norm_c != _NULL]
+        if present.empty:
+            continue
+
+        is_high_card = (unique_c >= HIGH_CARDINALITY and unique_o >= HIGH_CARDINALITY)
+
+        if is_high_card:
+            # Tier 1 — high-cardinality: bypass overlap check.
+            # Sort key: (tier=1, uniqueness) — higher uniqueness = better.
+            score_key = (1, unique)
+        else:
+            # Tier 0 — medium-cardinality: require cross-file overlap.
+            overlap = present.isin(set(norm_o)).mean()
+            if overlap < min_overlap:
+                continue
+            bucket = int(overlap * 20) / 20
+            score_key = (0, bucket, unique)
+
+        scored.append((score_key, client_col, norm_c.tolist(), norm_o.tolist()))
+
+    scored.sort(key=lambda t: t[0], reverse=True)
+    return [(name, c, o) for _, name, c, o in scored[:max_cols]]
+
+
+
+def _align_by_sequential_identity(
+    df_client: pd.DataFrame,
+    df_output: pd.DataFrame,
+    primary_client: str,
+    primary_output: str,
+    mapped_pairs: list[tuple[str, Optional[str]]],
+) -> Optional[AlignedDataFrames]:
+    """
+    Primary-field-only matching. For every client row:
+      1. restrict to output rows with the same primary value;
+      2. walk identity columns one by one, keeping only output rows whose value
+         equals the client's value; stop as soon as exactly one row is left;
+      3. a column that would eliminate every candidate is ignored (it is
+         expected to differ); a row the best column cannot find is retried
+         with the next column, and only reported missing if all fail;
+      4. if identity values repeat, candidates are ranked by how many other
+         mapped fields agree (ranking only — never used to reject a row).
+    Each output row is used at most once. Returns None if no usable identity
+    column exists (caller falls back to occurrence matching).
+    """
+    id_cols: list = []
+    for min_unique in (0.2, 0.05):          # relax if rows repeat heavily
+        id_cols = _pick_identity_columns(
+            df_client, df_output, primary_client, primary_output, mapped_pairs,
+            min_unique=min_unique,
+        )
+        if id_cols:
+            break
+    if not id_cols:
+        return None
+
+    prim_c = df_client[primary_client].map(_normalize_key_val).tolist()
+    prim_o = df_output[primary_output].map(_normalize_key_val).tolist()
+    c_vals = [c for _, c, _ in id_cols]
+    o_vals = [o for _, _, o in id_cols]
+
+    # Raw values of every other mapped column — only used to rank candidates
+    # when identity values repeat (never to reject a row).
+    score_cols = [
+        (df_client[cc].tolist(), df_output[oc].tolist())
+        for cc, oc in mapped_pairs
+        if oc and cc != primary_client and oc != primary_output
+        and cc in df_client.columns and oc in df_output.columns
+    ]
+
+    n_ids = len(id_cols)
+
+    # One lookup per identity column: (primary, value) -> output positions
+    indexes: list[dict[tuple, list[int]]] = []
+    for lvl in range(n_ids):
+        idx: dict[tuple, list[int]] = {}
+        for j, key in enumerate(zip(prim_o, o_vals[lvl])):
+            idx.setdefault(key, []).append(j)
+        indexes.append(idx)
+
+    consumed: set[int] = set()
+    pairs: list[tuple[int, int]] = []
+    ambiguous = 0
+    pending = list(range(len(df_client)))
+
+    # Level 0 uses the best identity column. Rows it cannot find fall through
+    # to the next column, so one differing field never drops a row by itself.
+    for lvl in range(n_ids):
+        if not pending:
+            break
+        groups: dict[tuple, list[int]] = {}
+        still_pending: list[int] = []
+        for i in pending:
+            v = c_vals[lvl][i]
+            if v == _NULL:
+                still_pending.append(i)
+            else:
+                groups.setdefault((prim_c[i], v), []).append(i)
+
+        for key, clients in groups.items():
+            pool = [j for j in indexes[lvl].get(key, []) if j not in consumed]
+            if not pool:
+                still_pending.extend(clients)
+                continue
+
+            # Narrow each client row's candidates with the other identity
+            # columns, one at a time; stop once exactly one row is left.
+            cands: dict[int, list[int]] = {}
+            for i in clients:
+                cand = pool
+                for k in range(n_ids):
+                    if k == lvl:
+                        continue
+                    if len(cand) <= 1:
+                        break
+                    v = c_vals[k][i]
+                    if v == _NULL:
+                        continue
+                    narrowed = [j for j in cand if o_vals[k][j] == v]
+                    if narrowed:          # a column that rejects everything is ignored
+                        cand = narrowed
+                cands[i] = cand
+
+            singles = [c[0] for c in cands.values() if len(c) == 1]
+            if len(singles) == len(clients) and len(set(singles)) == len(singles):
+                chosen = [(i, cands[i][0]) for i in clients]
+            else:
+                # Identity values repeat: rank candidate pairs by how many other
+                # mapped fields agree, then assign the best pairs first.
+                ambiguous += len(clients)
+                edges = []
+                for i in clients:
+                    for j in cands[i]:
+                        score = sum(_values_agree(cr[i], orr[j]) for cr, orr in score_cols)
+                        edges.append((-score, i, j))
+                edges.sort()
+                used_c: set[int] = set()
+                used_o: set[int] = set()
+                chosen = []
+                for _, i, j in edges:
+                    if i in used_c or j in used_o:
+                        continue
+                    used_c.add(i)
+                    used_o.add(j)
+                    chosen.append((i, j))
+                still_pending.extend(i for i in clients if i not in used_c)
+
+            pairs.extend(chosen)
+            consumed.update(j for _, j in chosen)
+
+        pending = still_pending
+
+    pairs.sort()
+    unmatched_client = sorted(pending)
+    unmatched_output = [j for j in range(len(df_output)) if j not in consumed]
+
+    def _keys(prims, firsts, positions):
+        seen: dict[str, int] = {}
+        out = []
+        for p in positions:
+            base = f"{prims[p]}||{firsts[p]}"
+            seen[base] = seen.get(base, 0) + 1
+            out.append(f"{base}||#{seen[base]}")
+        return out
+
+    ci = [i for i, _ in pairs]
+    oi = [j for _, j in pairs]
+
+    both = pd.concat(
+        [
+            df_client.iloc[ci].add_suffix("_client").reset_index(drop=True),
+            df_output.iloc[oi].add_suffix("_output").reset_index(drop=True),
+        ],
+        axis=1,
+    )
+    both["_row_key_"] = _keys(prim_c, c_vals[0], ci)
+
+    client_only = df_client.iloc[unmatched_client].add_suffix("_client").reset_index(drop=True)
+    client_only["_row_key_"] = _keys(prim_c, c_vals[0], unmatched_client)
+
+    output_only = df_output.iloc[unmatched_output].add_suffix("_output").reset_index(drop=True)
+    output_only["_row_key_"] = _keys(prim_o, o_vals[0], unmatched_output)
+
+    return AlignedDataFrames(
+        merged=both,
+        client_only=client_only,
+        output_only=output_only,
+        inferred_identity_cols=[name for name, _, _ in id_cols],
+        ambiguous_rows=ambiguous,
+    )
+
 
 def build_composite_key(
     df: pd.DataFrame,
@@ -316,6 +590,7 @@ def align_rows(
     output_key_cols: list[Optional[str]],
     client_sort_col: Optional[str] = None,
     output_sort_col: Optional[str] = None,
+    mapped_column_pairs: Optional[list[tuple[str, Optional[str]]]] = None,
 ) -> AlignedDataFrames:
     """
     Align rows between two DataFrames using composite keys.
@@ -329,7 +604,22 @@ def align_rows(
     client_sort_col         : optional column in client used to sort rows WITHIN
                               each primary group (not added to the key)
     output_sort_col         : corresponding sort column in output file
+    mapped_column_pairs     : (client_col, output_col) pairs — when only ONE key field
+                              is set, these are searched (one by one) to find the
+                              matching output row inside each primary group
     """
+    active_client = [c for c in client_key_cols if c]
+    active_output = [c for c in output_key_cols if c]
+    if len(active_client) == 1 and len(active_output) == 1 and mapped_column_pairs:
+        aligned = _align_by_sequential_identity(
+            df_client, df_output,
+            active_client[0], active_output[0],
+            mapped_column_pairs,
+        )
+        if aligned is not None:
+            return aligned
+
+    inferred_labels: list[str] = []
     df_c = build_composite_key(df_client, client_key_cols, sort_within_col=client_sort_col)
     df_o = build_composite_key(df_output, output_key_cols, sort_within_col=output_sort_col)
 
@@ -353,4 +643,5 @@ def align_rows(
         merged=both,
         client_only=client_only,
         output_only=output_only,
+        inferred_identity_cols=inferred_labels,
     )
