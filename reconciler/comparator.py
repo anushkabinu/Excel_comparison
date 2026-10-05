@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Optional
+import datetime as dt_mod
 
 import numpy as np
 import pandas as pd
@@ -90,12 +91,69 @@ def _try_numeric(s: pd.Series) -> pd.Series:
     return pd.to_numeric(s, errors="coerce")
 
 
+def _is_datetime_value(v) -> bool:
+    return isinstance(v, (dt_mod.datetime, dt_mod.date, pd.Timestamp)) and not isinstance(v, bool)
+
+
+def _is_excel_serial_date(s: pd.Series) -> bool:
+    """True if values look like Excel date serials (e.g. 46113 = 2026-04-01)."""
+    sample = s.dropna().head(300)
+    if sample.empty:
+        return False
+    if pd.api.types.is_datetime64_any_dtype(s):
+        return False
+    if sample.map(_is_datetime_value).mean() > 0.5:
+        return False
+    num = pd.to_numeric(sample, errors="coerce")
+    if num.notna().mean() < 0.7:
+        return False
+    vals = num.dropna().astype(float)
+    if vals.empty:
+        return False
+    integerish = (np.abs(vals - np.round(vals)) < 1e-6).mean() >= 0.9
+    in_range = ((vals >= 20000) & (vals <= 80000)).mean() >= 0.8
+    unique_ratio = vals.nunique() / len(vals)
+    return bool(integerish and in_range and unique_ratio < 0.8)
+
+
 def _try_datetime(s: pd.Series) -> pd.Series:
-    """Attempt to coerce a series to datetime. Returns NaT where not possible."""
+    """Parse strings/datetimes. Do not treat raw integers as ns timestamps."""
     try:
+        if pd.api.types.is_numeric_dtype(s):
+            return pd.Series(pd.NaT, index=s.index)
         return pd.to_datetime(s, errors="coerce")
     except Exception:
-        return pd.Series([pd.NaT] * len(s), index=s.index)
+        return pd.Series(pd.NaT, index=s.index)
+
+
+def _to_datetime_series(s: pd.Series) -> pd.Series:
+    """Normalize a column to calendar dates, including Excel serials."""
+    out = pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns]")
+    valid = s.notna()
+    if not valid.any():
+        return out
+
+    if pd.api.types.is_datetime64_any_dtype(s):
+        return pd.to_datetime(s, errors="coerce").dt.normalize()
+
+    is_dt = s.map(_is_datetime_value)
+    if is_dt.any():
+        out.loc[is_dt] = pd.to_datetime(s[is_dt], errors="coerce")
+
+    is_str = s.map(lambda v: isinstance(v, str))
+    if is_str.any():
+        # Do not use dayfirst=True: it turns ISO "2026-04-01" into 4 January.
+        out.loc[is_str] = pd.to_datetime(s[is_str], errors="coerce")
+
+    still = valid & out.isna()
+    if still.any():
+        num = pd.to_numeric(s[still], errors="coerce")
+        ok = num.notna()
+        if ok.any():
+            idx = num.index[ok]
+            out.loc[idx] = pd.to_datetime(num[ok].astype(float), unit="D", origin="1899-12-30")
+
+    return pd.to_datetime(out, errors="coerce").dt.normalize()
 
 
 def _detect_col_type(s: pd.Series) -> str:
@@ -103,6 +161,8 @@ def _detect_col_type(s: pd.Series) -> str:
     sample = s.dropna().head(300)
     if sample.empty:
         return "text"
+    if pd.api.types.is_datetime64_any_dtype(s) or sample.map(_is_datetime_value).mean() > 0.7:
+        return "datetime"
     num = _try_numeric(sample)
     if num.notna().mean() > 0.7:
         return "numeric"
@@ -110,6 +170,32 @@ def _detect_col_type(s: pd.Series) -> str:
     if dt.notna().mean() > 0.7:
         return "datetime"
     return "text"
+
+
+def pair_is_date_column(col_c: pd.Series, col_o: pd.Series) -> bool:
+    """True when this mapped pair should be compared/displayed as dates."""
+    typ_c = _detect_col_type(col_c)
+    typ_o = _detect_col_type(col_o)
+    return (
+        typ_c == "datetime"
+        or typ_o == "datetime"
+        or (_is_excel_serial_date(col_c) and _is_excel_serial_date(col_o))
+    )
+
+
+def format_date_cell(v):
+    """Display a date or Excel serial as YYYY-MM-DD; otherwise return v."""
+    if v is None or v == "":
+        return ""
+    try:
+        if pd.isna(v):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    ts = _to_datetime_series(pd.Series([v])).iloc[0]
+    if pd.isna(ts):
+        return v
+    return pd.Timestamp(ts).strftime("%Y-%m-%d")
 
 
 def _normalize_column_pair(
@@ -123,14 +209,19 @@ def _normalize_column_pair(
     typ_c = _detect_col_type(col_c)
     typ_o = _detect_col_type(col_o)
 
-    # Agree on a type (prefer numeric > datetime > text)
+    # Datetime wins over numeric so Excel serials (46113) match real dates.
+    if typ_c == "datetime" or typ_o == "datetime" or (
+        _is_excel_serial_date(col_c) and _is_excel_serial_date(col_o)
+    ):
+        return _to_datetime_series(col_c), _to_datetime_series(col_o), "datetime"
+
     priority = {"numeric": 2, "datetime": 1, "text": 0}
     col_type = typ_c if priority[typ_c] >= priority[typ_o] else typ_o
 
     if col_type == "numeric":
         return _try_numeric(col_c), _try_numeric(col_o), "numeric"
     if col_type == "datetime":
-        return _try_datetime(col_c), _try_datetime(col_o), "datetime"
+        return _to_datetime_series(col_c), _to_datetime_series(col_o), "datetime"
     # text — strip and lowercase
     return _normalize_series_text(col_c.astype(str).where(col_c.notna(), other=np.nan)), \
            _normalize_series_text(col_o.astype(str).where(col_o.notna(), other=np.nan)), \
@@ -206,7 +297,7 @@ def compare_dataframes(
     row_results: list[RowResult] = []
     cell_diffs: list[CellDifference] = []
 
-    total_cells_compared = 0
+    total_cells_compared = 0    
     matched_cells = 0
     mismatched_cells = 0
     missing_cell_values = 0
@@ -219,6 +310,34 @@ def compare_dataframes(
         for m in column_mappings
         if m.output_col is not None
     ]
+
+    # #region agent log
+    import json as _dbg_json, time as _dbg_time
+    _DBG_PATH = r"c:\Users\anush\OneDrive\Documents\project_folders\excel_comparison\debug-54883f.log"
+    def _agent_dbg(hypothesis_id, location, message, data=None):
+        try:
+            with open(_DBG_PATH, "a", encoding="utf-8") as _f:
+                _f.write(_dbg_json.dumps({
+                    "sessionId": "54883f",
+                    "runId": "post-fix",
+                    "hypothesisId": hypothesis_id,
+                    "location": location,
+                    "message": message,
+                    "data": data or {},
+                    "timestamp": int(_dbg_time.time() * 1000),
+                    "id": f"log_{int(_dbg_time.time() * 1000)}",
+                }, default=str) + "\n")
+        except Exception:
+            pass
+    _t_cmp = _dbg_time.time()
+    _agent_dbg("E", "comparator.py:compare_dataframes", "start", {
+        "n_merged": len(merged),
+        "n_missing": len(client_only),
+        "n_extra": len(output_only),
+        "n_cols": len(col_map_pairs),
+    })
+    _type_logs = 0
+    # #endregion
 
     # For Excel column index (A1 notation) we need to know column position in client
     client_col_positions = {col: idx + 1 for idx, col in enumerate(df_client_orig.columns)}
@@ -242,7 +361,32 @@ def compare_dataframes(
         col_c = merged[c_key]
         col_o = merged[o_key]
 
+        typ_c = _detect_col_type(col_c)
+        typ_o = _detect_col_type(col_o)
         norm_c, norm_o, col_type = _normalize_column_pair(col_c, col_o)
+        # #region agent log
+        _serial = _is_excel_serial_date(col_c) or _is_excel_serial_date(col_o)
+        _dt_mix = (typ_c == "datetime") != (typ_o == "datetime")
+        if _serial or _dt_mix or (_type_logs < 5 and typ_c != typ_o):
+            if not (_serial or _dt_mix):
+                _type_logs += 1
+            _sc = col_c.dropna()
+            _so = col_o.dropna()
+            _nc = norm_c.dropna()
+            _no = norm_o.dropna()
+            _agent_dbg("F", "comparator.py:compare_dataframes", "col type", {
+                "client_col": str(client_col)[:60],
+                "typ_c": typ_c,
+                "typ_o": typ_o,
+                "chosen": col_type,
+                "serial_c": _is_excel_serial_date(col_c),
+                "serial_o": _is_excel_serial_date(col_o),
+                "sample_c": str(_sc.iloc[0])[:40] if len(_sc) else None,
+                "sample_o": str(_so.iloc[0])[:40] if len(_so) else None,
+                "norm_c": str(_nc.iloc[0])[:40] if len(_nc) else None,
+                "norm_o": str(_no.iloc[0])[:40] if len(_no) else None,
+            })
+        # #endregion
 
         # Both null → match
         both_null = norm_c.isna() & norm_o.isna()
@@ -268,7 +412,11 @@ def compare_dataframes(
         elif col_type == "datetime":
             match_arr = np.zeros(n_rows, dtype=bool)
             match_arr[both_null.values] = True
-            match_arr[both_present.values] = (norm_c[both_present] == norm_o[both_present]).values
+            if both_present.any():
+                match_arr[both_present.values] = (
+                    norm_c[both_present].dt.strftime("%Y-%m-%d").values
+                    == norm_o[both_present].dt.strftime("%Y-%m-%d").values
+                )
         else:
             match_arr = np.zeros(n_rows, dtype=bool)
             match_arr[both_null.values] = True
@@ -433,6 +581,14 @@ def compare_dataframes(
         rel_tolerance=rel_tol,
     )
 
+    # #region agent log
+    _agent_dbg("E", "comparator.py:compare_dataframes", "done", {
+        "elapsed_ms": int((_dbg_time.time() - _t_cmp) * 1000),
+        "n_diffs": len(cell_diffs),
+        "matched_rows": matched_rows,
+        "mismatched_rows": mismatched_rows,
+    })
+    # #endregion
     return ComparisonResult(
         summary=summary,
         row_results=all_row_results,

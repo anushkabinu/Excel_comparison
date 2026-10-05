@@ -20,6 +20,30 @@ from typing import Optional
 import pandas as pd
 import numpy as np
 
+# #region agent log
+import json as _dbg_json
+import time as _dbg_time
+
+_DBG_PATH = r"c:\Users\anush\OneDrive\Documents\project_folders\excel_comparison\debug-54883f.log"
+
+
+def _agent_dbg(hypothesis_id, location, message, data=None):
+    try:
+        with open(_DBG_PATH, "a", encoding="utf-8") as _f:
+            _f.write(_dbg_json.dumps({
+                "sessionId": "54883f",
+                "runId": "post-fix",
+                "hypothesisId": hypothesis_id,
+                "location": location,
+                "message": message,
+                "data": data or {},
+                "timestamp": int(_dbg_time.time() * 1000),
+                "id": f"log_{int(_dbg_time.time() * 1000)}",
+            }, default=str) + "\n")
+    except Exception:
+        pass
+# #endregion
+
 
 # ---------------------------------------------------------------------------
 # Public dataclasses
@@ -297,6 +321,9 @@ def _pick_identity_columns(
     """
     HIGH_CARDINALITY = 0.40   # >=40% unique in both files -> unconditionally trusted
     scored = []
+    # #region agent log
+    _t_pick = _dbg_time.time()
+    # #endregion
 
     for client_col, output_col in mapped_pairs:
         if not output_col or client_col == primary_client or output_col == primary_output:
@@ -338,7 +365,19 @@ def _pick_identity_columns(
         scored.append((score_key, client_col, norm_c.tolist(), norm_o.tolist()))
 
     scored.sort(key=lambda t: t[0], reverse=True)
-    return [(name, c, o) for _, name, c, o in scored[:max_cols]]
+    picked = [(name, c, o) for _, name, c, o in scored[:max_cols]]
+    # #region agent log
+    _agent_dbg("B", "row_matcher.py:_pick_identity_columns", "pick done", {
+        "elapsed_ms": int((_dbg_time.time() - _t_pick) * 1000),
+        "min_unique": min_unique,
+        "n_mapped": len(mapped_pairs),
+        "n_scored": len(scored),
+        "picked": [n for n, _, _ in picked],
+        "n_client": len(df_client),
+        "n_output": len(df_output),
+    })
+    # #endregion
+    return picked
 
 
 
@@ -378,16 +417,38 @@ def _align_by_sequential_identity(
     c_vals = [c for _, c, _ in id_cols]
     o_vals = [o for _, _, o in id_cols]
 
-    # Raw values of every other mapped column — only used to rank candidates
-    # when identity values repeat (never to reject a row).
+    # Pre-normalize ranking columns once. Using raw cells + _values_agree here
+    # re-parsed every client×candidate pair (91k pairs × 41 cols in the last run).
+    _t_score_norm = _dbg_time.time()
     score_cols = [
-        (df_client[cc].tolist(), df_output[oc].tolist())
+        (
+            df_client[cc].map(_normalize_key_val).tolist(),
+            df_output[oc].map(_normalize_key_val).tolist(),
+        )
         for cc, oc in mapped_pairs
         if oc and cc != primary_client and oc != primary_output
         and cc in df_client.columns and oc in df_output.columns
     ]
+    _score_norm_ms = int((_dbg_time.time() - _t_score_norm) * 1000)
 
     n_ids = len(id_cols)
+
+    # #region agent log
+    _t_match = _dbg_time.time()
+    _max_clients_grp = 0
+    _max_pool = 0
+    _n_edge_evals = 0
+    _n_narrow_scans = 0
+    _t_score_ms = 0.0
+    _agent_dbg("A", "row_matcher.py:_align_by_sequential_identity", "match start", {
+        "n_client": len(df_client),
+        "n_output": len(df_output),
+        "n_ids": n_ids,
+        "id_names": [n for n, _, _ in id_cols],
+        "n_score_cols": len(score_cols),
+        "score_norm_ms": _score_norm_ms,
+    })
+    # #endregion
 
     # One lookup per identity column: (primary, value) -> output positions
     indexes: list[dict[tuple, list[int]]] = []
@@ -398,6 +459,7 @@ def _align_by_sequential_identity(
         indexes.append(idx)
 
     consumed: set[int] = set()
+
     pairs: list[tuple[int, int]] = []
     ambiguous = 0
     pending = list(range(len(df_client)))
@@ -422,6 +484,11 @@ def _align_by_sequential_identity(
                 still_pending.extend(clients)
                 continue
 
+            # #region agent log
+            _max_clients_grp = max(_max_clients_grp, len(clients))
+            _max_pool = max(_max_pool, len(pool))
+            # #endregion
+
             # Narrow each client row's candidates with the other identity
             # columns, one at a time; stop once exactly one row is left.
             cands: dict[int, list[int]] = {}
@@ -435,8 +502,11 @@ def _align_by_sequential_identity(
                     v = c_vals[k][i]
                     if v == _NULL:
                         continue
+                    # #region agent log
+                    _n_narrow_scans += len(cand)
+                    # #endregion
                     narrowed = [j for j in cand if o_vals[k][j] == v]
-                    if narrowed:          # a column that rejects everything is ignored
+                    if narrowed:      # skip a column that eliminates everything
                         cand = narrowed
                 cands[i] = cand
 
@@ -444,15 +514,32 @@ def _align_by_sequential_identity(
             if len(singles) == len(clients) and len(set(singles)) == len(singles):
                 chosen = [(i, cands[i][0]) for i in clients]
             else:
-                # Identity values repeat: rank candidate pairs by how many other
-                # mapped fields agree, then assign the best pairs first.
                 ambiguous += len(clients)
+                # #region agent log
+                _n_edges = sum(len(cands[i]) for i in clients)
+                _n_edge_evals += _n_edges * max(len(score_cols), 1)
+                if _n_edges >= 200:
+                    _agent_dbg("A", "row_matcher.py:_align_by_sequential_identity", "large ambiguous group", {
+                        "lvl": lvl,
+                        "n_clients": len(clients),
+                        "n_edges": _n_edges,
+                        "n_score_cols": len(score_cols),
+                        "pool": len(pool),
+                    })
+                _ts = _dbg_time.time()
+                # #endregion
                 edges = []
                 for i in clients:
                     for j in cands[i]:
-                        score = sum(_values_agree(cr[i], orr[j]) for cr, orr in score_cols)
+                        score = sum(
+                            1 for cr, orr in score_cols
+                            if cr[i] != _NULL and cr[i] == orr[j]
+                        )
                         edges.append((-score, i, j))
                 edges.sort()
+                # #region agent log
+                _t_score_ms += (_dbg_time.time() - _ts) * 1000
+                # #endregion
                 used_c: set[int] = set()
                 used_o: set[int] = set()
                 chosen = []
@@ -472,6 +559,19 @@ def _align_by_sequential_identity(
     pairs.sort()
     unmatched_client = sorted(pending)
     unmatched_output = [j for j in range(len(df_output)) if j not in consumed]
+    # #region agent log
+    _agent_dbg("A", "row_matcher.py:_align_by_sequential_identity", "match done", {
+        "elapsed_ms": int((_dbg_time.time() - _t_match) * 1000),
+        "n_pairs": len(pairs),
+        "n_pending": len(pending),
+        "ambiguous": ambiguous,
+        "max_clients_grp": _max_clients_grp,
+        "max_pool": _max_pool,
+        "n_edge_evals": _n_edge_evals,
+        "n_narrow_scans": _n_narrow_scans,
+        "t_score_ms": int(_t_score_ms),
+    })
+    # #endregion
 
     def _keys(prims, firsts, positions):
         seen: dict[str, int] = {}
@@ -506,6 +606,190 @@ def _align_by_sequential_identity(
         output_only=output_only,
         inferred_identity_cols=[name for name, _, _ in id_cols],
         ambiguous_rows=ambiguous,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Multi-key composite matching with disambiguation
+# ---------------------------------------------------------------------------
+
+def _align_composite_with_disambiguation(
+    df_client: pd.DataFrame,
+    df_output: pd.DataFrame,
+    client_key_cols: list[str],
+    output_key_cols: list[str],
+    mapped_pairs: list[tuple[str, Optional[str]]],
+) -> AlignedDataFrames:
+    """
+    Match rows using a composite key (Field 1 + Field 2 [+ Field 3]).
+
+    For groups where the composite key is unique in both files → direct match.
+    For groups where the composite key repeats → progressively narrow using the
+    remaining mapped columns (highest cardinality first, same 'skip if zeroes'
+    rule as the single-key path).  If still multiple candidates remain, rank by
+    total agreement count and accept the best.  If no output row exists for a
+    client key → MISSING; extra output rows → EXTRA.
+
+    A cell difference must NOT prevent a row from being matched.  Only the
+    selected key columns drive the initial grouping; all mapped columns are
+    compared afterwards by the comparator.
+    """
+    # ── Build normalized base keys ─────────────────────────────────────────
+    def _make_base_keys(df: pd.DataFrame, key_cols: list[str]) -> list[str]:
+        parts = [df[c].map(_normalize_key_val) for c in key_cols if c in df.columns]
+        if not parts:
+            return [f"_row_{i}_" for i in range(len(df))]
+        result = parts[0]
+        for p in parts[1:]:
+            result = result + "||" + p
+        return result.tolist()
+
+    base_c = _make_base_keys(df_client, client_key_cols)
+    base_o = _make_base_keys(df_output, output_key_cols)
+
+    # ── Remaining mapped columns (not used as key cols) ────────────────────
+    key_c_set = set(client_key_cols)
+    key_o_set = set(output_key_cols)
+    extra_pairs = [
+        (cc, oc) for cc, oc in mapped_pairs
+        if oc and cc not in key_c_set and oc not in key_o_set
+        and cc in df_client.columns and oc in df_output.columns
+    ]
+
+    # Pre-normalise remaining columns once (avoid repeated per-row calls)
+    norm_c = {cc: df_client[cc].map(_normalize_key_val).tolist() for cc, _ in extra_pairs}
+    norm_o = {oc: df_output[oc].map(_normalize_key_val).tolist() for _, oc in extra_pairs}
+
+    # Sort remaining pairs by min cardinality (most unique first → best discriminator)
+    def _card(vals: list) -> float:
+        non_null = [v for v in vals if v != _NULL]
+        return len(set(non_null)) / len(non_null) if non_null else 0.0
+
+    extra_pairs_ranked = sorted(
+        extra_pairs,
+        key=lambda p: min(_card(norm_c[p[0]]), _card(norm_o[p[1]])),
+        reverse=True,
+    )
+
+    # ── Build output lookup: base_key → [output positions] ────────────────
+    out_by_key: dict[str, list[int]] = {}
+    for j, key in enumerate(base_o):
+        out_by_key.setdefault(key, []).append(j)
+
+    # ── Match client rows ──────────────────────────────────────────────────
+    pairs: list[tuple[int, int]] = []
+    unmatched_client: list[int] = []
+    consumed: set[int] = set()
+    ambiguous_count = 0
+
+    # Group client rows by their base key
+    cli_by_key: dict[str, list[int]] = {}
+    for i, key in enumerate(base_c):
+        cli_by_key.setdefault(key, []).append(i)
+
+    for key, cli_idxs in cli_by_key.items():
+        all_pool = out_by_key.get(key, [])
+
+        if not all_pool:
+            unmatched_client.extend(cli_idxs)
+            continue
+
+        for i in cli_idxs:
+            pool = [j for j in all_pool if j not in consumed]
+
+            if not pool:
+                unmatched_client.append(i)
+                continue
+
+            if len(pool) == 1:
+                pairs.append((i, pool[0]))
+                consumed.add(pool[0])
+                continue
+
+            # Progressive narrowing using ranked extra columns
+            current = pool
+            for cc, oc in extra_pairs_ranked:
+                c_val = norm_c[cc][i]
+                if c_val == _NULL:
+                    continue                       # skip null client value
+                narrowed = [j for j in current if norm_o[oc][j] == c_val]
+                if narrowed:                      # only keep if not zero candidates
+                    current = narrowed
+                if len(current) == 1:
+                    break
+
+            if len(current) == 1:
+                j = current[0]
+                if j not in consumed:
+                    pairs.append((i, j))
+                    consumed.add(j)
+                else:
+                    unmatched_client.append(i)
+                    ambiguous_count += 1
+            else:
+                # Still multiple → rank by total field agreement, take best
+                best_score, best_j = -1, None
+                for j in current:
+                    if j in consumed:
+                        continue
+                    score = sum(
+                        norm_c[cc][i] == norm_o[oc][j]
+                        for cc, oc in extra_pairs_ranked
+                        if norm_c[cc][i] != _NULL
+                    )
+                    if score > best_score:
+                        best_score, best_j = score, j
+
+                if best_j is not None:
+                    pairs.append((i, best_j))
+                    consumed.add(best_j)
+                    ambiguous_count += 1
+                else:
+                    unmatched_client.append(i)
+                    ambiguous_count += 1
+
+    unmatched_output = [j for j in range(len(df_output)) if j not in consumed]
+
+    # ── Assemble output DataFrames in the same format as align_rows ────────
+    pairs.sort()
+    ci = [i for i, _ in pairs]
+    oi = [j for _, j in pairs]
+
+    # Unique row key per pair (base key + occurrence within the matched set)
+    seen: dict[str, int] = {}
+    row_keys = []
+    for i in ci:
+        k = base_c[i]
+        seen[k] = seen.get(k, 0) + 1
+        row_keys.append(f"{k}||#{seen[k]}")
+
+    both = pd.concat([
+        df_client.iloc[ci].add_suffix("_client").reset_index(drop=True),
+        df_output.iloc[oi].add_suffix("_output").reset_index(drop=True),
+    ], axis=1)
+    both["_row_key_"] = row_keys
+
+    def _build_unmatched_keys(idxs, base_vals, suffix):
+        seen2: dict[str, int] = {}
+        keys = []
+        for idx in idxs:
+            k = base_vals[idx]
+            seen2[k] = seen2.get(k, 0) + 1
+            keys.append(f"{k}||#{seen2[k]}")
+        return keys
+
+    client_only = df_client.iloc[unmatched_client].add_suffix("_client").reset_index(drop=True)
+    client_only["_row_key_"] = _build_unmatched_keys(unmatched_client, base_c, "c")
+
+    output_only = df_output.iloc[unmatched_output].add_suffix("_output").reset_index(drop=True)
+    output_only["_row_key_"] = _build_unmatched_keys(unmatched_output, base_o, "o")
+
+    return AlignedDataFrames(
+        merged=both,
+        client_only=client_only,
+        output_only=output_only,
+        inferred_identity_cols=[],
+        ambiguous_rows=ambiguous_count,
     )
 
 
@@ -604,12 +888,25 @@ def align_rows(
     client_sort_col         : optional column in client used to sort rows WITHIN
                               each primary group (not added to the key)
     output_sort_col         : corresponding sort column in output file
-    mapped_column_pairs     : (client_col, output_col) pairs — when only ONE key field
-                              is set, these are searched (one by one) to find the
-                              matching output row inside each primary group
+    mapped_column_pairs     : (client_col, output_col) pairs used to:
+                              a) find the matching output row inside each primary
+                                 group (single-key path), OR
+                              b) disambiguate duplicate composite keys (multi-key path)
     """
     active_client = [c for c in client_key_cols if c]
     active_output = [c for c in output_key_cols if c]
+
+    # #region agent log
+    _t_align = _dbg_time.time()
+    _agent_dbg("E", "row_matcher.py:align_rows", "start", {
+        "n_client": len(df_client),
+        "n_output": len(df_output),
+        "client_keys": active_client,
+        "n_mapped": len(mapped_column_pairs or []),
+    })
+    # #endregion
+
+    # ── Case 1: Only Field 1 selected → progressive identity matching ──────
     if len(active_client) == 1 and len(active_output) == 1 and mapped_column_pairs:
         aligned = _align_by_sequential_identity(
             df_client, df_output,
@@ -617,8 +914,38 @@ def align_rows(
             mapped_column_pairs,
         )
         if aligned is not None:
+            # #region agent log
+            _agent_dbg("A", "row_matcher.py:align_rows", "sequential done", {
+                "elapsed_ms": int((_dbg_time.time() - _t_align) * 1000),
+                "merged": len(aligned.merged),
+                "client_only": len(aligned.client_only),
+                "output_only": len(aligned.output_only),
+                "ambiguous": aligned.ambiguous_rows,
+                "id_cols": aligned.inferred_identity_cols,
+            })
+            # #endregion
             return aligned
 
+    # ── Case 2: Field 2 or 3 also selected → composite key + disambiguation ─
+    if len(active_client) >= 2 and mapped_column_pairs:
+        aligned = _align_composite_with_disambiguation(
+            df_client, df_output,
+            active_client, active_output,
+            mapped_column_pairs,
+        )
+        # #region agent log
+        _agent_dbg("D", "row_matcher.py:align_rows", "composite done", {
+            "elapsed_ms": int((_dbg_time.time() - _t_align) * 1000),
+            "merged": len(aligned.merged),
+            "client_only": len(aligned.client_only),
+            "output_only": len(aligned.output_only),
+            "ambiguous": aligned.ambiguous_rows,
+        })
+        # #endregion
+        return aligned
+
+    # ── Case 3: Fallback — occurrence-based composite key ─────────────────
+    # (used when no mapped_column_pairs are provided, e.g. legacy callers)
     inferred_labels: list[str] = []
     df_c = build_composite_key(df_client, client_key_cols, sort_within_col=client_sort_col)
     df_o = build_composite_key(df_output, output_key_cols, sort_within_col=output_sort_col)
@@ -639,9 +966,18 @@ def align_rows(
         if "_row_key_" in frame.columns:
             frame.sort_values("_row_key_", inplace=True, ignore_index=True)
 
+    # #region agent log
+    _agent_dbg("E", "row_matcher.py:align_rows", "fallback done", {
+        "elapsed_ms": int((_dbg_time.time() - _t_align) * 1000),
+        "merged": len(both),
+        "client_only": len(client_only),
+        "output_only": len(output_only),
+    })
+    # #endregion
     return AlignedDataFrames(
         merged=both,
         client_only=client_only,
         output_only=output_only,
         inferred_identity_cols=inferred_labels,
     )
+

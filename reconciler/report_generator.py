@@ -27,7 +27,7 @@ from openpyxl.styles import (
 from openpyxl.utils import get_column_letter
 from openpyxl.utils.dataframe import dataframe_to_rows
 
-from reconciler.comparator import ComparisonResult
+from reconciler.comparator import ComparisonResult, format_date_cell, pair_is_date_column
 
 
 # ---------------------------------------------------------------------------
@@ -363,10 +363,10 @@ def generate_wide_report(
 ) -> str:
     """
     Generate a wide-format Excel report where every compared column appears
-    as three sub-columns: ACTUAL (client), EXPECTED (output), RESULT (PASS/FAIL).
+    as three sub-columns: ACTUAL (output), EXPECTED (client), RESULT (PASS/FAIL).
 
     Each data row is a **key-matched pair** from ComparisonResult (not positional).
-    ACTUAL is always taken from the client excel row; EXPECTED from the paired
+    EXPECTED is always taken from the client excel row; ACTUAL from the paired
     output excel row. PASS/FAIL comes from the comparator (incl. numeric tolerance).
 
     Layout
@@ -409,8 +409,43 @@ def generate_wide_report(
         for m in result.column_mappings
         if m.output_col
     ]
+    date_fields = {
+        i
+        for i, (cc, oc) in enumerate(col_pairs)
+        if cc in client_idx.columns and oc in output_idx.columns
+        and pair_is_date_column(client_idx[cc], output_idx[oc])
+    }
 
     # ── 2. Build data rows from key-matched pairs only ─────────────────────
+
+    # #region agent log
+    import json as _dbg_json, time as _dbg_time
+    _DBG_PATH = r"c:\Users\anush\OneDrive\Documents\project_folders\excel_comparison\debug-54883f.log"
+    def _agent_dbg(hypothesis_id, location, message, data=None):
+        try:
+            with open(_DBG_PATH, "a", encoding="utf-8") as _f:
+                _f.write(_dbg_json.dumps({
+                    "sessionId": "54883f",
+                    "runId": "post-fix",
+                    "hypothesisId": hypothesis_id,
+                    "location": location,
+                    "message": message,
+                    "data": data or {},
+                    "timestamp": int(_dbg_time.time() * 1000),
+                    "id": f"log_{int(_dbg_time.time() * 1000)}",
+                }, default=str) + "\n")
+        except Exception:
+            pass
+    _t_wide = _dbg_time.time()
+    _agent_dbg("E", "report_generator.py:generate_wide_report", "start", {
+        "n_row_results": len(result.row_results),
+        "n_fields": len(col_pairs),
+        "n_date_fields": len(date_fields),
+        "n_client": len(df_client),
+        "n_output": len(df_output),
+    })
+    _date_res_logged = False
+    # #endregion
 
     data_rows = []
     field_pass_counts = [0] * len(col_pairs)
@@ -425,15 +460,37 @@ def generate_wide_report(
         for field_idx, (client_col, output_col) in enumerate(col_pairs):
             c_val = _safe_cell_value(client_idx, rr.client_excel_row, client_col)
             o_val = _safe_cell_value(output_idx, rr.output_excel_row, output_col)
-
-            # RESULT follows comparator decision (tolerance already applied)
-            if (rr.row_key, client_col) in diff_set:
+            if field_idx in date_fields:
+                _c_raw, _o_raw = c_val, o_val
+                c_val = format_date_cell(c_val)
+                o_val = format_date_cell(o_val)
+                # RESULT must follow the dates shown, not a stale numeric/serial diff.
+                if c_val == o_val:
+                    res = "PASS"
+                    field_pass_counts[field_idx] += 1
+                else:
+                    res = "FAIL"
+                # #region agent log
+                if not _date_res_logged:
+                    _date_res_logged = True
+                    _agent_dbg("H", "report_generator.py:generate_wide_report", "date result", {
+                        "col": str(client_col)[:60],
+                        "c_raw": str(_c_raw)[:40],
+                        "o_raw": str(_o_raw)[:40],
+                        "c_fmt": str(c_val)[:40],
+                        "o_fmt": str(o_val)[:40],
+                        "in_diff_set": (rr.row_key, client_col) in diff_set,
+                        "result": res,
+                    })
+                # #endregion
+            elif (rr.row_key, client_col) in diff_set:
                 res = "FAIL"
             else:
                 res = "PASS"
                 field_pass_counts[field_idx] += 1
 
-            row.extend([c_val, o_val, res])
+            # ACTUAL = output file, EXPECTED = client file
+            row.extend([o_val, c_val, res])
 
         data_rows.append(row)
 
@@ -634,5 +691,12 @@ def generate_wide_report(
     ws.freeze_panes = ws.cell(row=3, column=_DATA_COL0)
 
     wb.save(filepath)
+    # #region agent log
+    _agent_dbg("E", "report_generator.py:generate_wide_report", "saved", {
+        "elapsed_ms": int((_dbg_time.time() - _t_wide) * 1000),
+        "n_compared": n_compared,
+        "n_fields": len(col_pairs),
+    })
+    # #endregion
     return os.path.abspath(filepath)
 
